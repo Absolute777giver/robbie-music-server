@@ -4,6 +4,7 @@
 #   /prepare?q=...    -> JSON {"id","title","source"}: ESP32 calls this first
 #   /stream/<id>.mp3  -> MP3 stream for ESP32 (starts immediately)
 #   /play?q=...       -> search + MP3 in one step (handy for a browser test)
+#   /radio/<name>.mp3 -> live radio (HLS) converted to MP3 for ESP32: europa, retro
 import os
 import sys
 import json
@@ -141,3 +142,94 @@ def play():
     except Exception as e:
         return "not found: " + str(e), 404
     return mp3_stream(t)
+
+
+# Kazakhstan versions of these stations exist only as HLS (m3u8),
+# which is too heavy for ESP32 -> the server converts them to a plain MP3 stream
+RADIO = {
+    "europa": "https://hls-01-regions.emgsound.ru/11_kazakhstan/112/playlist.m3u8",
+    "retro": "https://radiohub.kz/s/retrofm/112/playlist.m3u8",
+}
+
+
+def hls_reader(url, out, stop):
+    """Downloads HLS segments one after another and writes them to ffmpeg."""
+    import time
+    import urllib.request
+    from urllib.parse import urljoin
+
+    def get(u):
+        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.geturl(), r.read()
+
+    seen = []
+    errors = 0
+    while not stop.is_set():
+        try:
+            base, data = get(url)
+            lines = data.decode("utf-8", "ignore").splitlines()
+            # master playlist -> go to the real (media) playlist
+            if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):
+                url = urljoin(base, [l for l in lines if l and not l.startswith("#")][0])
+                continue
+            wait = 3
+            for l in lines:
+                if l.startswith("#EXT-X-TARGETDURATION:"):
+                    wait = max(1, int(float(l.split(":")[1])) // 2)
+            segs = [urljoin(base, l) for l in lines if l and not l.startswith("#")]
+            if not seen:
+                segs = segs[-3:]                     # start close to live
+            for seg in segs:
+                if seg in seen or stop.is_set():
+                    continue
+                _, chunk = get(seg)
+                out.write(chunk)
+                out.flush()
+                seen.append(seg)
+                seen = seen[-50:]
+            errors = 0
+            time.sleep(wait)
+        except Exception:
+            errors += 1
+            if errors > 5:
+                break
+            time.sleep(2)
+    try:
+        out.close()
+    except Exception:
+        pass
+
+
+@app.route("/radio/<name>.mp3")
+def radio(name):
+    import threading
+    url = RADIO.get(name)
+    if not url:
+        return "unknown station", 404
+    enc = subprocess.Popen(
+        [FFMPEG, "-loglevel", "error", "-f", "mpegts", "-i", "pipe:0",
+         "-vn", "-ac", "1", "-ar", "44100", "-b:a", "96k", "-f", "mp3", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    stop = threading.Event()
+    threading.Thread(target=hls_reader, args=(url, enc.stdin, stop), daemon=True).start()
+    first = enc.stdout.read(4096)          # wait until the station really plays
+    if not first:
+        stop.set()
+        enc.kill()
+        return "station not available", 502
+
+    def generate():
+        try:
+            yield first
+            while True:
+                chunk = enc.stdout.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            stop.set()
+            enc.kill()
+
+    return Response(generate(), mimetype="audio/mpeg",
+                    headers={"Cache-Control": "no-cache"})
