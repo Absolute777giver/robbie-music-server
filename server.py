@@ -146,9 +146,15 @@ def play():
 
 # Kazakhstan versions of these stations exist only as HLS (m3u8),
 # which is too heavy for ESP32 -> the server converts them to a plain MP3 stream
+# Same sources as the players on top-radio.ru/almatyi
 RADIO = {
+    # Europa Plus Kazakhstan: HLS -> converted to MP3
     "europa": "https://hls-01-regions.emgsound.ru/11_kazakhstan/112/playlist.m3u8",
-    "retro": "https://radiohub.kz/s/retrofm/112/playlist.m3u8",
+}
+# Plain MP3 streams that only play with the top-radio.ru Referer (ESP32 can't send it)
+RADIO_MP3 = {
+    # Retro FM Qazaqstan
+    "retro": "https://radiosolo.ru/radio/retrofmkz/icecast.audio",
 }
 
 
@@ -201,9 +207,38 @@ def hls_reader(url, out, stop):
         pass
 
 
+def mp3_relay(url):
+    """Passes an MP3 stream through, adding the headers the source wants."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://top-radio.ru/",
+        "Origin": "https://top-radio.ru",
+    })
+    try:
+        src = urllib.request.urlopen(req, timeout=15)
+    except Exception as e:
+        return "station not available: " + str(e)[:200], 502
+
+    def generate():
+        try:
+            while True:
+                chunk = src.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            src.close()
+
+    return Response(generate(), mimetype="audio/mpeg",
+                    headers={"Cache-Control": "no-cache"})
+
+
 @app.route("/radio/<name>.mp3")
 def radio(name):
     import threading
+    if name in RADIO_MP3:
+        return mp3_relay(RADIO_MP3[name])
     url = RADIO.get(name)
     if not url:
         return "unknown station", 404
